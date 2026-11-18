@@ -8,15 +8,21 @@ SQLite database in WAL mode:
   cache     -- the resolver's cache.  Absolute epoch deadlines are stored, so a
                resolver restart can never extend the validity of an old A
                record; the stale window simply keeps counting down.
+  dns64     -- the DNS64 /96 synthesis prefix, committed by the web console.
+               The row survives restarts; only a committed update replaces it.
   query_log -- every client query the resolver answered, with its source.
   auth_log  -- every query the authoritative endpoint saw, with the action it
                took (answered / nxdomain / dropped / delayed).
 """
 from __future__ import annotations
 
+import fcntl
+import ipaddress
 import os
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 
 # --------------------------------------------------------------------------
 # Configuration (environment overridable; defaults are the spec values).
@@ -38,6 +44,10 @@ WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))
 
 DEFAULT_IP = os.environ.get("DEFAULT_IP", "192.0.2.10")
 DEFAULT_DELAY = float(os.environ.get("DEFAULT_DELAY", "3.0"))
+
+# DNS64: IPv6-only clients reach IPv4-only services through a /96 prefix.
+DNS64_WELL_KNOWN_PREFIX = "64:ff9b::/96"
+DNS64_PREFIX = os.environ.get("DNS64_PREFIX", DNS64_WELL_KNOWN_PREFIX)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS control (
@@ -67,9 +77,22 @@ CREATE TABLE IF NOT EXISTS auth_log (
   ts REAL NOT NULL,
   qname TEXT, qtype TEXT, mode TEXT, action TEXT, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS dns64 (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  prefix TEXT NOT NULL,            -- committed /96 synthesis prefix
+  updated_at REAL NOT NULL
+);
 """
 
 _LOG_TABLES = ("query_log", "auth_log")
+
+# Serialises "check the committed DNS64 prefix" + "build the answer" in the
+# resolver against "commit a new prefix" in the web process.  flock is per open
+# file description, so it works across processes as well as threads; it is
+# released automatically if a process dies.  The lock file lives next to the
+# database so every role sees the same one.
+_DNS64_LOCK_PATH = DB_PATH + ".dns64.lock"
+_dns64_lock_thread = threading.Lock()
 
 
 def _connect() -> sqlite3.Connection:
@@ -91,6 +114,88 @@ def init_db() -> None:
             " VALUES (1, 'a', ?, ?, ?)",
             (DEFAULT_IP, DEFAULT_DELAY, time.time()),
         )
+        # Seed the DNS64 prefix once; later starts keep whatever was committed.
+        try:
+            prefix = _parse_dns64_prefix(DNS64_PREFIX)
+        except ValueError:
+            prefix = _parse_dns64_prefix(DNS64_WELL_KNOWN_PREFIX)
+        c.execute(
+            "INSERT OR IGNORE INTO dns64(id, prefix, updated_at) VALUES (1, ?, ?)",
+            (str(prefix), time.time()),
+        )
+
+
+# --------------------------------------------------------------------------
+# DNS64 prefix (+ the lock that makes prefix updates linearisable)
+# --------------------------------------------------------------------------
+def _parse_dns64_prefix(value: str) -> ipaddress.IPv6Network:
+    """Accept only a canonical /96 IPv6 network."""
+    net = ipaddress.ip_network(str(value).strip(), strict=True)
+    if net.version != 6:
+        raise ValueError("DNS64 prefix must be an IPv6 network")
+    if net.prefixlen != 96:
+        raise ValueError("DNS64 prefix must be a /96")
+    return net
+
+
+@contextmanager
+def dns64_lock():
+    """Hold the cross-process DNS64 lock.
+
+    The resolver takes it around "read the committed prefix + build the AAAA
+    answer"; the web console takes it around "validate + write the prefix".
+    That ordering guarantees an AAAA answer built after a successful update
+    can never contain the previous prefix, even for a query that started
+    before the update: either it read the old prefix and finished before the
+    writer committed, or it reads after the commit.
+    """
+    with _dns64_lock_thread:
+        directory = os.path.dirname(_DNS64_LOCK_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd = os.open(_DNS64_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def get_dns64_prefix() -> ipaddress.IPv6Network:
+    """The committed prefix, or the configured default if nothing is stored."""
+    with _connect() as c:
+        row = c.execute("SELECT prefix FROM dns64 WHERE id = 1").fetchone()
+    if row:
+        try:
+            return _parse_dns64_prefix(row["prefix"])
+        except ValueError:
+            pass
+    return _parse_dns64_prefix(DNS64_PREFIX)
+
+
+def set_dns64_prefix(value: str) -> ipaddress.IPv6Network:
+    """Validate then commit a new prefix.  Raises ValueError (and leaves the
+    stored prefix untouched) for anything that is not a /96 IPv6 network."""
+    prefix = _parse_dns64_prefix(value)
+    with dns64_lock():
+        with _connect() as c:
+            c.execute(
+                "INSERT INTO dns64(id, prefix, updated_at) VALUES (1, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET prefix = excluded.prefix,"
+                " updated_at = excluded.updated_at",
+                (str(prefix), time.time()),
+            )
+    return prefix
+
+
+def synthesise_aaaa(prefix: ipaddress.IPv6Network, ipv4: str) -> str:
+    """Embed an IPv4 address in the low 32 bits of the /96 prefix."""
+    net = ipaddress.ip_network(prefix, strict=False)
+    packed = net.network_address.packed[:12] + ipaddress.IPv4Address(ipv4).packed
+    return str(ipaddress.IPv6Address(packed))
 
 
 # --------------------------------------------------------------------------

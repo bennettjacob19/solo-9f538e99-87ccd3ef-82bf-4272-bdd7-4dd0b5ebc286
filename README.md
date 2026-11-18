@@ -31,7 +31,7 @@ DB_PATH=/tmp/dns/app.db RESOLVER_PORT=15353 AUTH_PORT=15354 python -m app.resolv
 DB_PATH=/tmp/dns/app.db RESOLVER_PORT=15353 WEB_PORT=8000 python -m app.web &
 ```
 
-自测（自动拉起三进程，跑全部关键交错，约 95 秒）：
+自测（自动拉起三进程，跑全部关键交错，约 130 秒）：
 
 ```bash
 python tests/selftest.py
@@ -56,15 +56,36 @@ python tests/selftest.py
 additional 段 TXT `_src.<域名>` 中带回），并展示双方日志。
 
 固定域名默认 `service.example`（`FIXED_DOMAIN` 可改）。解析器只服务该域名，
-其余名称 REFUSED，非 A 查询返回 NODATA。
+其余名称 REFUSED，非 A/AAAA 查询返回 NODATA。
+
+## DNS64
+
+仅 IPv6 的客户端经 NAT64 访问只有 A 记录的 `service.example`：解析器的 AAAA
+查询不向上游发 AAAA，而是复用 A 的缓存/回源/serve-stale 路径，把 IPv4 地址
+嵌入已提交的 **/96** 合成前缀（默认 `64:ff9b::/96`，`DNS64_PREFIX` 可改，
+网页可随时修改并立即生效）。
+
+- 网页"DNS64 合成前缀"可设置 /96 前缀；非法前缀（非 IPv6、非 /96）或写入
+  失败时返回错误，**原前缀继续有效**。
+- 前缀持久化在 `dns64` 表，已提交的前缀**重启后仍然有效**；只有成功的更新
+  才会替换它。
+- 合成答复的 TTL **不超过所用 A 的剩余有效时间**：新鲜 A 用剩余 fresh 时间，
+  过期后仅在原 20 秒窗口内用剩余 stale 时间；窗口结束即不再合成。
+- 新鲜 NXDOMAIN 原样返回（rcode=NXDOMAIN）；过期且回源失败、没有可用 A 时
+  返回 SERVFAIL。
+- 解析器在**跨进程锁**内读取前缀并发送 AAAA 报文；网页在同一把锁内提交新
+  前缀。因此前缀更新成功后发出的任何 AAAA 都不含旧前缀（即使查询在更新前
+  已开始）。
+- A 查询保持原有规则不变。
+- 网页"查询 AAAA（DNS64）"发起真实 AAAA 查询并显示答复、TTL 与来源。
 
 ## 文件
 
 ```
-app/common.py       配置 + SQLite 状态面
+app/common.py       配置 + SQLite 状态面（含 DNS64 前缀）
 app/auth_server.py  可控权威端（dnslib 编解码，线程并发）
-app/resolver.py     缓存/serve-stale 解析器
+app/resolver.py     缓存/serve-stale 解析器 + DNS64 AAAA 合成
 app/web.py          FastAPI 操作网页
-tests/selftest.py   端到端自测（A–F 六组场景）
+tests/selftest.py   端到端自测（A–G 七组场景，含 DNS64）
 Dockerfile / docker-compose.yml / requirements.txt
 ```

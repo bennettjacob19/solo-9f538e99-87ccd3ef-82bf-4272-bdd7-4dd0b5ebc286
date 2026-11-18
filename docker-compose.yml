@@ -30,6 +30,7 @@ services:
       FRESH_TTL: "5"        # successful answers are fresh for 5s
       STALE_WINDOW: "20"    # stale A usable at most 20s past expiry
       UPSTREAM_TIMEOUT: "2" # seconds waiting for the authoritative endpoint
+      DNS64_PREFIX: "64:ff9b::/96"  # default /96 synthesis prefix
     ports:
       - "5353:5353/udp"
     volumes:
@@ -47,6 +48,7 @@ services:
       WEB_PORT: "8000"
       RESOLVER_HOST: resolver
       RESOLVER_PORT: "5353"
+      DNS64_PREFIX: "64:ff9b::/96"  # default /96 synthesis prefix
     ports:
       - "8000:8000"
     volumes:

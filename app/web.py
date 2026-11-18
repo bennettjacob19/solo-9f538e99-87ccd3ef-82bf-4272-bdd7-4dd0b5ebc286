@@ -3,8 +3,11 @@
 Serves a single-page console that can
   * switch the authoritative endpoint's behaviour for the fixed domain
     (A record / NXDOMAIN / delayed A / timeout),
-  * fire a real DNS query at the resolver and show the actual reply together
-    with where it came from (upstream / cache-fresh / cache-stale / none),
+  * set the DNS64 /96 synthesis prefix (validated; a failed write leaves the
+    previously committed prefix in place, and it survives restarts),
+  * fire a real DNS query (A or AAAA) at the resolver and show the actual reply
+    together with where it came from (upstream / cache-fresh / cache-stale /
+    none),
   * show the resolver cache state (with live countdowns) and the query logs
     of both the resolver and the authoritative endpoint.
 """
@@ -69,27 +72,39 @@ PAGE = """<!doctype html>
 </section>
 
 <section>
-  <h2>2. 发起查询（经解析器）</h2>
-  <button onclick="doQuery()">查询 A 记录</button>
+  <h2>2. DNS64 合成前缀（/96）</h2>
+  <p>
+    前缀：<input type="text" id="prefix" value="64:ff9b::" style="width:14rem">
+    &nbsp; <button onclick="applyPrefix()">应用</button>
+    <span id="prefixmsg"></span>
+  </p>
+  <p class="muted">当前已提交前缀：<b id="curprefix">…</b>
+    &nbsp; AAAA 答复由 A 记录合成，TTL 不超过所用 A 的剩余有效时间。</p>
+</section>
+
+<section>
+  <h2>3. 发起查询（经解析器）</h2>
+  <button onclick="doQuery('A')">查询 A 记录</button>
+  <button onclick="doQuery('AAAA')">查询 AAAA（DNS64）</button>
   <span id="qmsg"></span>
   <div id="qresult"></div>
   <pre id="qraw" style="display:none"></pre>
 </section>
 
 <section>
-  <h2>3. 解析器缓存状态</h2>
+  <h2>4. 解析器缓存状态</h2>
   <div id="cache">…</div>
 </section>
 
 <section>
-  <h2>4. 解析器查询日志（最近 15 条）</h2>
+  <h2>5. 解析器查询日志（最近 15 条）</h2>
   <table id="rlog"><thead><tr>
     <th>时间</th><th>名称</th><th>类型</th><th>来源</th><th>RCODE</th><th>答复</th><th>说明</th>
   </tr></thead><tbody></tbody></table>
 </section>
 
 <section>
-  <h2>5. 权威端接收日志（最近 15 条）</h2>
+  <h2>6. 权威端接收日志（最近 15 条）</h2>
   <table id="alog"><thead><tr>
     <th>时间</th><th>名称</th><th>类型</th><th>模式</th><th>动作</th><th>说明</th>
   </tr></thead><tbody></tbody></table>
@@ -115,6 +130,9 @@ async function refresh() {
     document.getElementById('params').textContent =
       `成功答复 TTL=${s.params.fresh_ttl}s · 过期后旧 A 最多沿用 ${s.params.stale_window}s` +
       ` · 上游超时 ${s.params.upstream_timeout}s`;
+    document.getElementById('curprefix').textContent = s.dns64_prefix;
+    if (document.activeElement.id !== 'prefix')
+      document.getElementById('prefix').value = s.dns64_prefix;
     const c = s.control;
     if (c) {
       document.getElementById('curmode').textContent =
@@ -156,9 +174,19 @@ async function applyMode() {
   refresh();
 }
 
-async function doQuery() {
+async function applyPrefix() {
+  const body = { prefix: document.getElementById('prefix').value };
+  const r = await (await fetch('/api/dns64', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })).json();
+  document.getElementById('prefixmsg').textContent =
+    r.ok ? ' ✔ 已提交 ' + r.prefix : ' ✘ ' + r.error;
+  refresh();
+}
+
+async function doQuery(qtype) {
   document.getElementById('qmsg').textContent = ' 查询中…';
-  const r = await (await fetch('/api/query', {method: 'POST'})).json();
+  const r = await (await fetch('/api/query', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({qtype}) })).json();
   document.getElementById('qmsg').textContent = '';
   const el = document.getElementById('qresult');
   if (!r.ok) { el.innerHTML = '<b class="bad">查询失败：' + r.error + '</b>'; return; }
@@ -188,6 +216,14 @@ class ModeIn(BaseModel):
     delay_seconds: float | None = None
 
 
+class PrefixIn(BaseModel):
+    prefix: str
+
+
+class QueryIn(BaseModel):
+    qtype: str = "A"
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return PAGE
@@ -203,6 +239,7 @@ def state() -> dict:
             "stale_window": common.STALE_WINDOW,
             "upstream_timeout": common.UPSTREAM_TIMEOUT,
         },
+        "dns64_prefix": str(common.get_dns64_prefix()),
         "control": common.get_control(),
         "cache": common.get_cache(),
         "resolver_log": common.recent("query_log"),
@@ -228,10 +265,38 @@ def set_mode(m: ModeIn):
     return {"ok": True, "control": common.get_control()}
 
 
+@app.post("/api/dns64")
+def set_dns64(p: PrefixIn):
+    """Validate and commit a new /96 prefix.
+
+    Invalid input is rejected before touching the state; if the commit itself
+    fails the previously stored prefix is still in force.  Either way the
+    response is the prefix that is actually committed.
+    """
+    try:
+        prefix = common.set_dns64_prefix(p.prefix)
+    except ValueError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc),
+             "prefix": str(common.get_dns64_prefix())},
+            400,
+        )
+    except Exception as exc:  # noqa: BLE001 - storage failure
+        return JSONResponse(
+            {"ok": False, "error": f"write failed: {type(exc).__name__}: {exc}",
+             "prefix": str(common.get_dns64_prefix())},
+            500,
+        )
+    return {"ok": True, "prefix": str(prefix)}
+
+
 @app.post("/api/query")
-def do_query() -> dict:
-    """Fire a real A query at the resolver and report the actual reply."""
-    query = DNSRecord.question(common.FQDN, "A")
+def do_query(q: QueryIn | None = None) -> dict:
+    """Fire a real A or AAAA query at the resolver and report the actual reply."""
+    qtype = ((q.qtype if q else "A") or "A").upper()
+    if qtype not in ("A", "AAAA"):
+        return {"ok": False, "error": f"unsupported qtype {qtype!r}"}
+    query = DNSRecord.question(common.FQDN, qtype)
     t0 = time.time()
     try:
         data = query.send(common.RESOLVER_HOST, common.RESOLVER_PORT,
@@ -251,6 +316,7 @@ def do_query() -> dict:
     )
     return {
         "ok": True,
+        "qtype": qtype,
         "rcode": RCODE[rep.header.rcode],
         "answers": answers,
         "source": source,

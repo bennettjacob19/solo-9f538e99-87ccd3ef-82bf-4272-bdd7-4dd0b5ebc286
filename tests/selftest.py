@@ -11,6 +11,8 @@ the key interleavings:
   D. a late (delayed) old answer cannot resurrect anything
   E. resolver restart does not extend the old A's validity
   F. web console smoke test (page, mode switch, query, state)
+  G. DNS64: AAAA synthesis from the A cache, TTL bounded by A validity, prefix
+     update atomicity/validation/persistence, NXDOMAIN and SERVFAIL passthrough
 
 Exits non-zero if any check fails.  Runtime: ~95s.
 """
@@ -22,7 +24,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -117,9 +121,9 @@ def clear_cache() -> None:
     conn.close()
 
 
-def dns_query() -> tuple[int, list[tuple], str | None]:
+def dns_query(qtype: str = "A") -> tuple[int, list[tuple], str | None]:
     """Returns (rcode, [(type, data, ttl)], source)."""
-    q = DNSRecord.question(DOMAIN, "A")
+    q = DNSRecord.question(DOMAIN, qtype)
     data = q.send("127.0.0.1", RES_PORT, timeout=8)
     rep = DNSRecord.parse(data)
     answers = [(QTYPE[rr.rtype], str(rr.rdata), rr.ttl) for rr in rep.rr]
@@ -130,6 +134,25 @@ def dns_query() -> tuple[int, list[tuple], str | None]:
             if txt.startswith("source="):
                 src = txt.split("=", 1)[1].split()[0]
     return rep.header.rcode, answers, src
+
+
+def synthesise(prefix: str, ipv4: str) -> str:
+    import ipaddress
+
+    net = ipaddress.ip_network(prefix, strict=False)
+    return str(ipaddress.IPv6Address(net.network_address.packed[:12]
+                                     + ipaddress.IPv4Address(ipv4).packed))
+
+
+def post_json(path: str, body: dict, timeout: float = 10) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{WEB_PORT}{path}", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
 
 
 def check(name: str, cond: bool, info: str = "") -> None:
@@ -331,6 +354,134 @@ def main() -> int:
             check("F5 非法模式被拒绝", False)
         except urllib.error.HTTPError as e:
             check("F5 非法模式被拒绝", e.code == 400)
+
+        # -- G. DNS64 --------------------------------------------------------
+        print("G. DNS64 AAAA 合成 / 前缀更新 / 校验 / 持久化", flush=True)
+        P1, P2 = "64:ff9b::/96", "2001:db8:64::/96"
+        status, res = post_json("/api/dns64", {"prefix": P1})
+        check("G1 可设置 /96 前缀", status == 200 and res["ok"]
+              and res["prefix"] == "64:ff9b::/96", f"res={res}")
+
+        set_mode("a", "192.0.2.70")
+        clear_cache()
+        rc, ans, src = dns_query("AAAA")
+        check("G2 AAAA 由 A 合成（回源）",
+              rc == 0 and len(ans) == 1 and ans[0][0] == "AAAA"
+              and ans[0][1] == synthesise(P1, "192.0.2.70")
+              and 1 <= ans[0][2] <= 5 and src == "upstream", f"ans={ans} src={src}")
+        cache = get_cache()
+        check("G3 未单独缓存 AAAA（A 缓存仍是唯一来源）",
+              cache["a_record"] == "192.0.2.70", f"cache={cache}")
+
+        time.sleep(2)
+        rc, ans, src = dns_query("AAAA")
+        check("G4 命中 A 缓存时 TTL 为 A 的剩余有效时间",
+              rc == 0 and src == "cache-fresh" and ans
+              and ans[0][1] == synthesise(P1, "192.0.2.70")
+              and 1 <= ans[0][2] < 5, f"ans={ans} src={src}")
+
+        # stale A is synthesized only inside its original 20s window
+        fresh_until, stale_until = cache["fresh_until"], cache["stale_until"]
+        set_mode("timeout")
+        sleep_until(fresh_until + 0.5)
+        stale_left = get_cache()["stale_until"] - time.time()
+        rc, ans, src = dns_query("AAAA")
+        check("G5 过期+回源失败 -> 用旧 A 合成，TTL<=剩余 stale",
+              rc == 0 and src == "cache-stale" and ans
+              and ans[0][1] == synthesise(P1, "192.0.2.70")
+              and ans[0][2] <= stale_left + 0.5
+              and ans[0][2] <= 20, f"ans={ans} src={src} stale_left={stale_left:.1f}")
+        sleep_until(stale_until + 1)
+        rc, ans, src = dns_query("AAAA")
+        check("G6 超过原 20s 窗口不再合成 -> SERVFAIL",
+              rc == 2 and not ans and src == "none", f"rcode={rc} ans={ans}")
+
+        # fresh NXDOMAIN is passed through verbatim
+        set_mode("nxdomain")
+        rc, ans, src = dns_query("AAAA")
+        check("G7 新鲜 NXDOMAIN 原样返回",
+              rc == 3 and not ans and src == "upstream", f"rcode={rc} ans={ans}")
+        rc, ans, src = dns_query("AAAA")
+        check("G8 命中新鲜 NXDOMAIN 缓存", rc == 3 and not ans and src == "cache-fresh",
+              f"rcode={rc} src={src}")
+
+        # prefix updates: invalid input and failed writes keep the old prefix
+        status, res = post_json("/api/dns64", {"prefix": "not-a-prefix"})
+        check("G9 非法前缀被拒绝且原设置保留",
+              status == 400 and not res["ok"]
+              and res["prefix"] == "64:ff9b::/96", f"res={res}")
+        status, res = post_json("/api/dns64", {"prefix": "2001:db8::/64"})
+        check("G10 非 /96 前缀被拒绝", status == 400 and not res["ok"]
+              and res["prefix"] == "64:ff9b::/96", f"res={res}")
+
+        set_mode("a", "192.0.2.80")
+        clear_cache()
+        rc, ans, src = dns_query("A")
+        assert rc == 0 and src == "upstream", f"setup failed: {rc} {src}"
+
+        status, res = post_json("/api/dns64", {"prefix": P2})
+        check("G11 更新前缀成功", status == 200 and res["ok"]
+              and res["prefix"] == "2001:db8:64::/96", f"res={res}")
+        rc, ans, src = dns_query("AAAA")
+        check("G12 更新后 AAAA 立即使用新前缀",
+              rc == 0 and ans and ans[0][1] == synthesise(P2, "192.0.2.80")
+              and ans[0][2] <= 5 and src == "cache-fresh",
+              f"ans={ans} src={src}")
+
+        # concurrent queries during an update: no AAAA built after a successful
+        # update may carry the old prefix
+        stop_flag = threading.Event()
+        violations: list[str] = []
+        accepted: list[tuple[float, str]] = []
+
+        def hammer() -> None:
+            while not stop_flag.is_set():
+                try:
+                    _rc, got, _src = dns_query("AAAA")
+                except Exception:
+                    continue
+                if got:
+                    accepted.append((time.time(), got[0][1]))
+
+        threads = [threading.Thread(target=hammer, daemon=True) for _ in range(3)]
+        for t in threads:
+            t.start()
+        time.sleep(0.4)
+        t_commit = time.time()
+        status, res = post_json("/api/dns64", {"prefix": P1})
+        committed_at = time.time()
+        time.sleep(0.6)
+        stop_flag.set()
+        for t in threads:
+            t.join(5)
+        old = synthesise(P2, "192.0.2.80")
+        # Anything that came back after the commit was already acknowledged
+        # must use the new prefix; allow only in-flight replies that returned
+        # before the commit finished.
+        for ts, aaaa in accepted:
+            if aaaa == old and ts > committed_at + 0.2:
+                violations.append(f"{aaaa} at +{ts - committed_at:.2f}s")
+        check("G13 更新成功后无旧前缀 AAAA（含并发查询）",
+              status == 200 and not violations and len(accepted) > 0,
+              f"committed={res.get('prefix')} violations={violations[:3]} "
+              f"old_seen={sum(1 for _, a in accepted if a == old)}/"
+              f"{len(accepted)}")
+
+        # persistence: committed prefix survives a resolver restart
+        stop("resolver")
+        time.sleep(1)
+        start("resolver", "app.resolver")
+        assert wait_resolver_ready(), "resolver did not come back"
+        set_mode("a", "192.0.2.90")
+        clear_cache()
+        rc, ans, src = dns_query("AAAA")
+        check("G14 重启后仍使用已提交前缀",
+              rc == 0 and len(ans) == 1 and ans[0][1] == synthesise(P1, "192.0.2.90")
+              and 1 <= ans[0][2] <= 5, f"ans={ans} src={src}")
+        rc, ans, src = dns_query("A")
+        check("G15 A 查询保持原规则", rc == 0 and ans and ans[0][0] == "A"
+              and ans[0][1] == "192.0.2.90"
+              and src in ("upstream", "cache-fresh"), f"ans={ans} src={src}")
     finally:
         for name in list(procs):
             stop(name)
